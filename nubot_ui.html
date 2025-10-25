@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nubot MCI - Voice Interface</title>
+    <!-- Load Tailwind CSS for utility styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load ROSLIBJS for WebSocket communication with ROS -->
+    <script type="text/javascript" src="http://static.robotwebtools.org/roslibjs/current/roslib.min.js"></script>
+
+    <style>
+        /* Custom font */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0fdfa; /* Light mint background */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        /* Keyframes for the pulsing effect when Nubot is speaking */
+        @keyframes pulse-speak {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(6, 78, 59, 0.7); }
+            70% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(6, 78, 59, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(6, 78, 59, 0); }
+        }
+
+        .pulsing {
+            animation: pulse-speak 1.5s infinite;
+        }
+    </style>
+</head>
+<body class="relative">
+
+    <!-- ROS Connection Status (Subtle Top-Right Corner) -->
+    <div id="rosStatus" class="absolute top-4 right-4 text-xs font-semibold px-2 py-1 rounded-full bg-gray-200 text-gray-700 shadow-md">
+        ROS Disconnected
+    </div>
+
+    <!-- Main Interface Card -->
+    <div class="w-full max-w-sm p-6 bg-white rounded-xl shadow-2xl border border-teal-100/50">
+        
+        <h1 class="text-3xl font-extrabold text-teal-800 text-center mb-4">Nubot MCI</h1>
+        <p class="text-center text-sm text-gray-500 mb-6">A Multimodal Conversational Interface</p>
+        
+        <!-- Nubot Visual (GIF/Emotion Placeholder) -->
+        <div id="visualContainer" class="flex justify-center mb-6">
+            <img id="emotionVisual" 
+                 src="https://placehold.co/200x200/99f6e4/065f46?text=Calm+Nubot" 
+                 alt="Nubot's Emotional Visual" 
+                 class="w-36 h-36 rounded-full object-cover transition-transform duration-300 transform shadow-xl border-4 border-teal-500">
+        </div>
+
+        <!-- System Status Bar -->
+        <div class="text-center mb-6">
+            <p class="text-lg font-bold text-gray-700">Status:</p>
+            <p id="systemStatus" class="text-base font-medium text-teal-600">Initializing...</p>
+        </div>
+
+        <!-- Interaction Log -->
+        <div class="space-y-4 mb-8">
+            <div class="bg-teal-50 p-3 rounded-lg border border-teal-200">
+                <p class="font-semibold text-teal-800">You Said:</p>
+                <p id="userTextDisplay" class="text-gray-700 italic text-sm">Waiting for voice input...</p>
+            </div>
+            <div class="bg-gray-100 p-3 rounded-lg border border-gray-300">
+                <p class="font-semibold text-gray-800">Nubot Responds:</p>
+                <p id="nubotResponseDisplay" class="text-gray-700 text-sm">...</p>
+            </div>
+        </div>
+        
+        <!-- Manual Activation Button (Backup) -->
+        <button id="listenButton" 
+                class="w-full py-3 bg-teal-600 text-white font-bold rounded-xl hover:bg-teal-700 transition duration-150 shadow-lg shadow-teal-500/50 flex items-center justify-center space-x-2"
+                disabled>
+            <svg id="micIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7v1a1 1 0 01-2 0v-1a7 7 0 01-7-7h1a1 1 0 010 2a5 5 0 0010 0 1 1 0 010-2h1zM12 18V6a4 4 0 10-4 4h8a4 4 0 10-4-4v12z"></path></svg>
+            <span id="buttonText">Start Listening</span>
+        </button>
+
+        <p class="text-xs text-center text-gray-400 mt-4">Microphone access required. Please allow in browser settings.</p>
+
+    </div>
+
+    <!-- JavaScript Logic -->
+    <script>
+        // --- Configuration ---
+        // IMPORTANT: REPLACE THE XXX WITH YOUR UBUNTU/ROS MACHINE'S IP ADDRESS!
+        const ROS_HOST = '127.0.0.1'; 
+        const ROS_PORT = 9090; 
+        const WAKE_WORD = 'hi nubot';
+        const NUBOT_VOICE = 'Kore'; 
+        
+        // --- DOM Elements ---
+        const rosStatusEl = document.getElementById('rosStatus');
+        const systemStatusEl = document.getElementById('systemStatus');
+        const userTextDisplayEl = document.getElementById('userTextDisplay');
+        const nubotResponseDisplayEl = document.getElementById('nubotResponseDisplay');
+        const listenButtonEl = document.getElementById('listenButton');
+        const buttonTextEl = document.getElementById('buttonText');
+        const emotionVisualEl = document.getElementById('emotionVisual');
+        
+        // --- State Management ---
+        let ros;
+        let stt; // Speech Recognition API
+        let audioPlayer = new Audio();
+        let currentMode = 'IDLE'; // States: IDLE, WAKE_WORD_LISTENING, ACTIVE_LISTENING, PROCESSING, SPEAKING
+
+        const STATE = {
+            IDLE: { status: 'System Ready', button: 'Waiting...', color: 'text-gray-500', enabled: false },
+            WAKE_WORD_LISTENING: { status: `Listening for "${WAKE_WORD}"...`, button: 'Voice Activated', color: 'text-teal-600', enabled: true },
+            ACTIVE_LISTENING: { status: 'Microphone Active. Speak Now.', button: 'Listening...', color: 'text-red-500', enabled: false },
+            PROCESSING: { status: 'Thinking...', button: 'Processing...', color: 'text-yellow-600', enabled: false },
+            SPEAKING: { status: 'Nubot Speaking...', button: 'Speaking...', color: 'text-blue-500', enabled: false }
+        };
+
+        // --- ROS Communication ---
+        
+        function updateROSStatus(isConnected) {
+            if (isConnected) {
+                rosStatusEl.textContent = 'ROS Connected';
+                rosStatusEl.className = 'absolute top-4 right-4 text-xs font-semibold px-2 py-1 rounded-full bg-green-100 text-green-700 shadow-md';
+                setAppState('WAKE_WORD_LISTENING');
+                startWakeWordDetection();
+            } else {
+                rosStatusEl.textContent = 'ROS Disconnected';
+                rosStatusEl.className = 'absolute top-4 right-4 text-xs font-semibold px-2 py-1 rounded-full bg-red-100 text-red-700 shadow-md';
+                setAppState('IDLE');
+                stopSTT();
+            }
+            listenButtonEl.disabled = !isConnected;
+        }
+
+        function initROS() {
+            ros = new ROSLIB.Ros({
+                url: `ws://${ROS_HOST}:${ROS_PORT}`
+            });
+
+            ros.on('connection', () => {
+                console.log('ROS Bridge: Connected.');
+                updateROSStatus(true);
+                initROSSubscribers();
+            });
+
+            ros.on('error', (error) => {
+                console.error('ROS Bridge: Error connecting.', error);
+                updateROSStatus(false);
+            });
+
+            ros.on('close', () => {
+                console.log('ROS Bridge: Disconnected.');
+                updateROSStatus(false);
+            });
+        }
+        
+        function initROSSubscribers() {
+            // 1. Publisher for user text input (sends transcribed query to ROS node)
+            const pub_user_text = new ROSLIB.Topic({
+                ros: ros,
+                name: '/nubot/user_text',
+                messageType: 'std_msgs/String'
+            });
+
+            // 2. Subscriber for Nubot's response text (displays the LLM's text)
+            const sub_response_text = new ROSLIB.Topic({
+                ros: ros,
+                name: '/nubot/response_text',
+                messageType: 'std_msgs/String'
+            });
+
+            sub_response_text.subscribe((message) => {
+                nubotResponseDisplayEl.textContent = message.data;
+                // Transition to SPEAKING state is handled by the audio_url subscriber 
+            });
+
+            // 3. Subscriber for the final audio URL (triggers playback)
+            const sub_audio_url = new ROSLIB.Topic({
+                ros: ros,
+                name: '/nubot/audio_url',
+                messageType: 'std_msgs/String'
+            });
+
+            sub_audio_url.subscribe((message) => {
+                playAudioFromBase64(message.data);
+            });
+            
+            // Assign publisher function to the button click handler
+            listenButtonEl.onclick = () => {
+                if (currentMode !== 'PROCESSING' && currentMode !== 'SPEAKING') {
+                    startActiveListening(pub_user_text);
+                }
+            };
+
+            // This closure function is used by the STT API to publish
+            window.publishUserText = (text) => {
+                const rosMessage = new ROSLIB.Message({ data: text });
+                pub_user_text.publish(rosMessage);
+                setAppState('PROCESSING');
+            };
+        }
+        
+        // --- Speech Recognition ---
+
+        function initSTT() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                alert('Speech Recognition API is not supported in this browser. Please use Chrome.');
+                listenButtonEl.disabled = true;
+                buttonTextEl.textContent = 'Browser Not Supported';
+                return;
+            }
+
+            stt = new SpeechRecognition();
+            stt.continuous = false;
+            stt.interimResults = false;
+            stt.lang = 'en-US'; 
+
+            stt.onresult = (event) => {
+                const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim();
+                
+                if (currentMode === 'WAKE_WORD_LISTENING') {
+                    if (transcript.includes(WAKE_WORD)) {
+                        stopSTT(); // Stop continuous listening
+                        userTextDisplayEl.textContent = `WAKE WORD DETECTED: "${transcript}"`;
+                        // Immediately start listening for the actual query after a brief moment
+                        setTimeout(() => startActiveListening(null), 500); 
+                    }
+                } else if (currentMode === 'ACTIVE_LISTENING') {
+                    userTextDisplayEl.textContent = transcript;
+                    window.publishUserText(transcript);
+                }
+            };
+
+            stt.onerror = (event) => {
+                console.error('STT Error:', event.error);
+                if (currentMode === 'ACTIVE_LISTENING') {
+                    setAppState('WAKE_WORD_LISTENING');
+                } else if (currentMode === 'WAKE_WORD_LISTENING') {
+                    // Automatically restart wake word listening on common errors
+                    startWakeWordDetection();
+                }
+            };
+            
+            stt.onend = () => {
+                if (currentMode !== 'PROCESSING' && currentMode !== 'SPEAKING') {
+                    // Auto-restart continuous listening if not in an active state
+                    if (currentMode === 'WAKE_WORD_LISTENING') {
+                        startWakeWordDetection();
+                    }
+                }
+            };
+        }
+        
+        function startWakeWordDetection() {
+            if (currentMode === 'WAKE_WORD_LISTENING' || currentMode === 'IDLE') {
+                 try {
+                    stt.start();
+                    setAppState('WAKE_WORD_LISTENING');
+                 } catch (e) {
+                    // Often throws error if already listening
+                    if (e.name !== 'InvalidStateError') console.error(e);
+                 }
+            }
+        }
+
+        function startActiveListening() {
+            stopSTT(); // Ensure any continuous listening is stopped
+            userTextDisplayEl.textContent = '';
+            nubotResponseDisplayEl.textContent = '...';
+
+            // Configure STT for a single, non-continuous capture
+            stt.continuous = false;
+            stt.onend = () => {
+                // If the user didn't speak, go back to wake word mode
+                if (currentMode === 'ACTIVE_LISTENING') {
+                    setAppState('WAKE_WORD_LISTENING');
+                }
+            };
+
+            try {
+                stt.start();
+                setAppState('ACTIVE_LISTENING');
+            } catch (e) {
+                console.error("Failed to start active listening:", e);
+                setAppState('WAKE_WORD_LISTENING'); // Fallback
+            }
+        }
+
+        function stopSTT() {
+            try {
+                stt.stop();
+            } catch (e) {
+                // Ignore InvalidStateError if STT isn't running
+            }
+        }
+
+        // --- Audio Playback ---
+
+        function playAudioFromBase64(base64Data) {
+            setAppState('SPEAKING');
+            
+            audioPlayer.src = base64Data;
+            audioPlayer.volume = 1.0; 
+            
+            // Add pulsing effect to visual
+            emotionVisualEl.classList.add('pulsing');
+            
+            audioPlayer.onended = () => {
+                emotionVisualEl.classList.remove('pulsing');
+                setAppState('WAKE_WORD_LISTENING');
+                startWakeWordDetection(); // Resume hands-free listening
+            };
+
+            audioPlayer.onerror = (e) => {
+                console.error("Audio playback error:", e);
+                emotionVisualEl.classList.remove('pulsing');
+                setAppState('WAKE_WORD_LISTENING');
+                startWakeWordDetection();
+            };
+
+            audioPlayer.play().catch(error => {
+                console.error("Playback failed (user gesture required?):", error);
+                // Inform user they might need to click somewhere first
+                nubotResponseDisplayEl.textContent += " (Click screen to enable audio)";
+                emotionVisualEl.classList.remove('pulsing');
+                setAppState('WAKE_WORD_LISTENING');
+                startWakeWordDetection();
+            });
+        }
+        
+        // --- State Update Function ---
+
+        function setAppState(newState) {
+            currentMode = newState;
+            const stateConfig = STATE[newState];
+
+            systemStatusEl.textContent = stateConfig.status;
+            systemStatusEl.className = `text-base font-medium ${stateConfig.color}`;
+            buttonTextEl.textContent = stateConfig.button;
+
+            if (newState === 'ACTIVE_LISTENING') {
+                emotionVisualEl.classList.add('border-red-500');
+                emotionVisualEl.classList.remove('border-teal-500');
+            } else {
+                emotionVisualEl.classList.add('border-teal-500');
+                emotionVisualEl.classList.remove('border-red-500');
+            }
+        }
+
+
+        // --- Initialization ---
+
+        window.onload = function () {
+            // Must initialize STT first, then ROS
+            initSTT();
+            initROS();
+            setAppState('IDLE');
+        }
+
+    </script>
+
+</body>
+</html>
